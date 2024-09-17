@@ -5,7 +5,7 @@ use kube::{
     runtime::{watcher, WatchStreamExt},
     Client,
 };
-use std::{collections::HashMap, error::Error};
+use std::{cmp::Ordering, collections::HashMap, error::Error};
 use thiserror::Error;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -27,15 +27,42 @@ impl LogIdentifier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
+enum LogLineError {
+    #[error("no timestamp")]
+    NoTimestamp,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct LogLine {
     pub id: LogIdentifier,
     pub message: String,
+    pub timestamp: String,
+}
+
+impl Ord for LogLine {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+impl PartialOrd for LogLine {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl LogLine {
-    fn new(id: LogIdentifier, message: String) -> Self {
-        Self { id, message }
+    fn new(id: LogIdentifier, message: String) -> Result<Self, Box<dyn Error>> {
+        if let Some((timestamp, message)) = message.split_once(" ") {
+            Ok(Self {
+                id,
+                message: message.to_string(),
+                timestamp: timestamp.to_string(),
+            })
+        } else {
+            Err(Box::new(LogLineError::NoTimestamp))
+        }
     }
 }
 
@@ -45,7 +72,11 @@ pub struct LogStream {
 }
 
 impl LogStream {
-    fn new(client: Client, id: LogIdentifier, tx: tokio::sync::mpsc::Sender<LogLine>) -> Self {
+    fn new(
+        client: Client,
+        id: LogIdentifier,
+        tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
+    ) -> Self {
         let pods: Api<Pod> = Api::namespaced(client, &id.namespace);
         let podname = id.pod.clone();
         let id2 = id.clone();
@@ -54,7 +85,8 @@ impl LogStream {
         tokio::spawn(async move {
             let mut log_params = LogParams::default();
             log_params.follow = true;
-            log_params.since_seconds = Some(15);
+            log_params.since_seconds = Some(3600);
+            log_params.timestamps = true;
             if let Ok(logs) = pods.log_stream(&podname, &log_params).await {
                 let mut lines = logs.lines();
                 loop {
@@ -64,7 +96,7 @@ impl LogStream {
                         }
                         line = lines.try_next() => {
                             if let Ok(Some(line)) = line {
-                                tx.send(LogLine::new(id2.clone(), line)).await.unwrap();
+                                let _ = tx.send(LogLine::new(id2.clone(), line).expect("couldn't create log line"));
                             }
                         }
                     }
@@ -89,11 +121,12 @@ pub enum LogStreamManagerMessage {
     Log(LogLine),
     LogSourceCreated(LogIdentifier),
     LogSourceRemoved(LogIdentifier),
+    LogSourceCancelled(LogIdentifier),
 }
 
 pub struct LogStreamManager {
     client: Client,
-    tx: tokio::sync::mpsc::Sender<LogLine>,
+    tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
     outbound_tx: tokio::sync::mpsc::Sender<LogStreamManagerMessage>,
     pub streams: HashMap<LogIdentifier, LogStream>,
 }
@@ -102,7 +135,7 @@ impl LogStreamManager {
     pub async fn new(
         outbound_tx: tokio::sync::mpsc::Sender<LogStreamManagerMessage>,
     ) -> Result<Self, Box<dyn Error>> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let outbound_tx2 = outbound_tx.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
@@ -116,7 +149,7 @@ impl LogStreamManager {
         let outbound_tx2 = outbound_tx.clone();
         tokio::spawn(async move {
             watcher(pods.clone(), watcher::Config::default())
-                .touched_objects()
+                .applied_objects()
                 .try_for_each(|p| async {
                     let namespace = p.namespace().unwrap_or("".to_string());
                     let pod = p.name_any();
@@ -154,6 +187,13 @@ impl LogStreamManager {
     pub fn drop_stream(&mut self, id: &LogIdentifier) -> Result<(), Box<dyn Error>> {
         if let Some(stream) = self.streams.remove(id) {
             stream.cancellation_token.cancel();
+            let tx = self.outbound_tx.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(LogStreamManagerMessage::LogSourceCancelled(id))
+                    .await;
+            });
             return Ok(());
         }
         Err(Box::new(LogStreamManagerError::StreamNotFound))

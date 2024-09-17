@@ -11,6 +11,7 @@ use ratatui::crossterm::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Row, Table, TableState};
+use std::collections::BTreeSet;
 use std::error::Error;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -34,7 +35,7 @@ pub struct Tui {
     pub cancellation_token: CancellationToken,
     pub tx: tokio::sync::mpsc::Sender<TuiMessage>,
     pub rx: tokio::sync::mpsc::Receiver<TuiMessage>,
-    messages: Vec<LogLine>,
+    messages: BTreeSet<LogLine>,
     log_table_state: TableState,
     source_table_state: TableState,
     log_stream_manager: LogStreamManager,
@@ -60,7 +61,7 @@ impl Tui {
             cancellation_token: CancellationToken::new(),
             tx,
             rx,
-            messages: vec![],
+            messages: BTreeSet::new(),
             log_table_state: TableState::new(),
             source_table_state: TableState::new(),
             log_stream_manager,
@@ -166,12 +167,17 @@ impl Tui {
     pub async fn handle_message(&mut self, message: TuiMessage) -> Result<(), Box<dyn Error>> {
         match message {
             TuiMessage::K8SMessage(msg) => match msg {
-                LogStreamManagerMessage::Log(log) => self.messages.push(log),
+                LogStreamManagerMessage::Log(log) => {
+                    self.messages.insert(log);
+                }
                 LogStreamManagerMessage::LogSourceCreated(src) => {
                     self.sources.push(src);
                 }
                 LogStreamManagerMessage::LogSourceRemoved(src) => {
                     self.sources.retain(|p| *p != src);
+                }
+                LogStreamManagerMessage::LogSourceCancelled(src) => {
+                    self.messages.retain(|m| m.id != src)
                 }
             },
             TuiMessage::Key(key) => match key.code {
@@ -181,6 +187,7 @@ impl Tui {
                 KeyCode::Char('j') => self.key_down(),
                 KeyCode::Enter => self.key_enter()?,
                 KeyCode::Esc => self.tx.send(TuiMessage::Exit).await?,
+                KeyCode::Char('q') => self.tx.send(TuiMessage::Exit).await?,
                 _ => {}
             },
             _ => return Err(Box::new(TuiError::UnhandleableMessage)),
