@@ -10,5 +10,6 @@ k8s-openapi = { version = "0.22.0", features = ["latest"] }
 kube = { version = "0.93.1", features = ["runtime"] }
 ratatui = "0.28.1"
 thiserror = "1.0.63"
+time = { version = "0.3.36", features = ["parsing"] }
 tokio = { version = "1.40.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-util = "0.7.12"

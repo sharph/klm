@@ -10,8 +10,8 @@ use ratatui::crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Row, Table, TableState};
-use std::collections::BTreeSet;
+use ratatui::widgets::{Row, Sparkline, Table, TableState};
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -72,7 +72,7 @@ impl Tui {
     pub fn start(&mut self) {
         let tx = self.tx.clone();
         let mut reader = EventStream::new();
-        tokio::spawn(async move {
+        self.task = tokio::spawn(async move {
             loop {
                 let event = reader.next().into_future().await;
                 match event {
@@ -89,7 +89,51 @@ impl Tui {
 
     pub fn stop(&self) {}
 
+    pub fn get_sparkline_for_source(&self, id: &LogIdentifier, buckets: usize) -> String {
+        if self.log_stream_manager.streams.get(&id).is_none() {
+            return (0..buckets)
+                .map(|_| ratatui::symbols::bar::NINE_LEVELS.empty)
+                .fold(String::new(), |a, b| a + b);
+        }
+        let mut buckets: Box<[u64]> = (0..buckets).map(|_| 0).collect();
+        let period: i128 = 60 * 1_000_000_000;
+        if let Some(last) = self.messages.last() {
+            let lasttime = last.timestamp;
+            let len = buckets.len();
+            for (idx, val) in buckets.iter_mut().enumerate() {
+                *val = self
+                    .messages
+                    .iter()
+                    .filter(|m| m.timestamp > lasttime - (len - idx) as i128 * period)
+                    .filter(|m| m.timestamp <= lasttime - (len - idx - 1) as i128 * period)
+                    .filter(|m| m.id == *id)
+                    .count() as u64;
+            }
+        }
+        let max = buckets.iter().fold(1, |a, b| a.max(*b));
+        buckets
+            .iter()
+            .map(|v| v * 7 / max) // always leave a little space at top of sparklines
+            .map(|v| match v {
+                0 => ratatui::symbols::bar::NINE_LEVELS.empty,
+                1 => ratatui::symbols::bar::NINE_LEVELS.one_eighth,
+                2 => ratatui::symbols::bar::NINE_LEVELS.one_quarter,
+                3 => ratatui::symbols::bar::NINE_LEVELS.three_eighths,
+                4 => ratatui::symbols::bar::NINE_LEVELS.half,
+                5 => ratatui::symbols::bar::NINE_LEVELS.five_eighths,
+                6 => ratatui::symbols::bar::NINE_LEVELS.three_quarters,
+                7 => ratatui::symbols::bar::NINE_LEVELS.seven_eighths,
+                8 => ratatui::symbols::bar::NINE_LEVELS.full,
+                _ => "X",
+            })
+            .fold(String::new(), |a, b| a + b)
+    }
+
     pub fn draw(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut sparkline_data: HashMap<LogIdentifier, String> = HashMap::new();
+        for id in self.log_stream_manager.streams.keys() {
+            sparkline_data.insert(id.clone(), self.get_sparkline_for_source(&id, 10));
+        }
         self.terminal
             .draw(|frame: &mut Frame| {
                 let layout = Layout::default()
@@ -106,7 +150,11 @@ impl Tui {
                 frame.render_stateful_widget(table, layout[0], &mut self.log_table_state);
                 // log sources
                 let rows = self.sources.iter().map(|s| {
-                    let mut row = Row::new(vec![s.pod.clone()]);
+                    let sparkline = sparkline_data
+                        .get(&s)
+                        .map(|v| v.clone())
+                        .unwrap_or_else(|| "     ".to_string());
+                    let mut row = Row::new(vec![sparkline, s.pod.clone()]);
                     if self.log_stream_manager.streams.get(&s).is_some() {
                         row = row.bold();
                     } else {
@@ -114,7 +162,7 @@ impl Tui {
                     }
                     row
                 });
-                let table = Table::new(rows, [Constraint::Fill(1)])
+                let table = Table::new(rows, [Constraint::Length(10), Constraint::Fill(1)])
                     .highlight_style(Style::new().reversed());
                 frame.render_stateful_widget(table, layout[1], &mut self.source_table_state);
             })

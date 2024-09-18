@@ -37,7 +37,7 @@ enum LogLineError {
 pub struct LogLine {
     pub id: LogIdentifier,
     pub message: String,
-    pub timestamp: String,
+    pub timestamp: i128,
 }
 
 impl Ord for LogLine {
@@ -55,10 +55,15 @@ impl PartialOrd for LogLine {
 impl LogLine {
     fn new(id: LogIdentifier, message: String) -> Result<Self, Box<dyn Error>> {
         if let Some((timestamp, message)) = message.split_once(" ") {
+            let timestamp = time::OffsetDateTime::parse(
+                timestamp,
+                &time::format_description::well_known::Rfc3339,
+            )?
+            .unix_timestamp_nanos();
             Ok(Self {
                 id,
                 message: message.to_string(),
-                timestamp: timestamp.to_string(),
+                timestamp,
             })
         } else {
             Err(Box::new(LogLineError::NoTimestamp))
@@ -85,7 +90,7 @@ impl LogStream {
         tokio::spawn(async move {
             let mut log_params = LogParams::default();
             log_params.follow = true;
-            log_params.since_seconds = Some(3600);
+            log_params.since_seconds = Some(600);
             log_params.timestamps = true;
             if let Ok(logs) = pods.log_stream(&podname, &log_params).await {
                 let mut lines = logs.lines();
