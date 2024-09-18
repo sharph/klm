@@ -134,6 +134,7 @@ pub struct LogStreamManager {
     tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
     outbound_tx: tokio::sync::mpsc::Sender<LogStreamManagerMessage>,
     pub streams: HashMap<LogIdentifier, LogStream>,
+    cancellation_token: CancellationToken,
 }
 
 impl LogStreamManager {
@@ -142,11 +143,21 @@ impl LogStreamManager {
     ) -> Result<Self, Box<dyn Error>> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let outbound_tx2 = outbound_tx.clone();
+        let cancellation_token = CancellationToken::new();
+        let cancellation_token2 = cancellation_token.clone();
         tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                let _ = outbound_tx2
-                    .send(LogStreamManagerMessage::Log(message))
-                    .await;
+            loop {
+                select! {
+                    _ = cancellation_token2.cancelled() => {
+                        rx.close();
+                        break;
+                    }
+                    Some(message) = rx.recv() => {
+                        let _ = outbound_tx2
+                            .send(LogStreamManagerMessage::Log(message))
+                            .await;
+                    }
+                }
             }
         });
         let client = Client::try_default().await?;
@@ -179,6 +190,7 @@ impl LogStreamManager {
             tx,
             outbound_tx,
             streams: HashMap::new(),
+            cancellation_token,
         })
     }
 
@@ -202,5 +214,13 @@ impl LogStreamManager {
             return Ok(());
         }
         Err(Box::new(LogStreamManagerError::StreamNotFound))
+    }
+
+    pub fn close(&mut self) -> Result<(), Box<dyn Error>> {
+        let streams: Vec<_> = self.streams.keys().map(LogIdentifier::clone).collect();
+        for stream in streams {
+            self.drop_stream(&stream)?;
+        }
+        Ok(())
     }
 }

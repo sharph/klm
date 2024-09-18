@@ -14,7 +14,7 @@ use ratatui::widgets::{Row, Sparkline, Table, TableState};
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Error, Debug)]
@@ -87,7 +87,12 @@ impl Tui {
         });
     }
 
-    pub fn stop(&self) {}
+    pub fn stop(&mut self) {
+        self.log_stream_manager
+            .close()
+            .expect("could not close stream manager");
+        self.rx.close();
+    }
 
     pub fn get_sparkline_for_source(&self, id: &LogIdentifier, buckets: usize) -> String {
         if self.log_stream_manager.streams.get(&id).is_none() {
@@ -234,8 +239,20 @@ impl Tui {
                 KeyCode::Down => self.key_down(),
                 KeyCode::Char('j') => self.key_down(),
                 KeyCode::Enter => self.key_enter()?,
-                KeyCode::Esc => self.tx.send(TuiMessage::Exit).await?,
-                KeyCode::Char('q') => self.tx.send(TuiMessage::Exit).await?,
+                KeyCode::Esc => {
+                    // if we send into the channel in the same loop that handles
+                    // messages, and it's full, we hang forever.
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        tx.send(TuiMessage::Exit).await.expect("couldn't send exit");
+                    });
+                }
+                KeyCode::Char('q') => {
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        tx.send(TuiMessage::Exit).await.expect("couldn't send exit");
+                    });
+                }
                 _ => {}
             },
             _ => return Err(Box::new(TuiError::UnhandleableMessage)),
