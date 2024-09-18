@@ -13,6 +13,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Row, Sparkline, Table, TableState};
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -35,7 +36,8 @@ pub struct Tui {
     pub cancellation_token: CancellationToken,
     pub tx: tokio::sync::mpsc::Sender<TuiMessage>,
     pub rx: tokio::sync::mpsc::Receiver<TuiMessage>,
-    messages: BTreeSet<LogLine>,
+    messages: BTreeSet<Arc<LogLine>>,
+    messages_by_src: HashMap<LogIdentifier, BTreeSet<Arc<LogLine>>>,
     log_table_state: TableState,
     source_table_state: TableState,
     log_stream_manager: LogStreamManager,
@@ -62,6 +64,7 @@ impl Tui {
             tx,
             rx,
             messages: BTreeSet::new(),
+            messages_by_src: HashMap::new(),
             log_table_state: TableState::new(),
             source_table_state: TableState::new(),
             log_stream_manager,
@@ -95,7 +98,7 @@ impl Tui {
     }
 
     pub fn get_sparkline_for_source(&self, id: &LogIdentifier, buckets: usize) -> String {
-        if self.log_stream_manager.streams.get(&id).is_none() {
+        if self.messages_by_src.get(&id).is_none() {
             return (0..buckets)
                 .map(|_| ratatui::symbols::bar::NINE_LEVELS.empty)
                 .fold(String::new(), |a, b| a + b);
@@ -107,11 +110,12 @@ impl Tui {
             let len = buckets.len();
             for (idx, val) in buckets.iter_mut().enumerate() {
                 *val = self
-                    .messages
+                    .messages_by_src
+                    .get(&id)
+                    .unwrap()
                     .iter()
                     .filter(|m| m.timestamp > lasttime - (len - idx) as i128 * period)
                     .filter(|m| m.timestamp <= lasttime - (len - idx - 1) as i128 * period)
-                    .filter(|m| m.id == *id)
                     .count() as u64;
             }
         }
@@ -221,7 +225,13 @@ impl Tui {
         match message {
             TuiMessage::K8SMessage(msg) => match msg {
                 LogStreamManagerMessage::Log(log) => {
-                    self.messages.insert(log);
+                    let log = Arc::new(log);
+                    self.messages.insert(log.clone());
+                    let id = log.id.clone();
+                    self.messages_by_src
+                        .get_mut(&id)
+                        .expect("can't find btree for log source")
+                        .insert(log);
                 }
                 LogStreamManagerMessage::LogSourceCreated(src) => {
                     self.sources.push(src);
@@ -229,7 +239,11 @@ impl Tui {
                 LogStreamManagerMessage::LogSourceRemoved(src) => {
                     self.sources.retain(|p| *p != src);
                 }
+                LogStreamManagerMessage::LogSourceSubscribed(src) => {
+                    self.messages_by_src.insert(src, BTreeSet::new());
+                }
                 LogStreamManagerMessage::LogSourceCancelled(src) => {
+                    self.messages_by_src.remove(&src);
                     self.messages.retain(|m| m.id != src)
                 }
             },

@@ -5,6 +5,7 @@ use kube::{
     runtime::{watcher, WatchStreamExt},
     Client,
 };
+use std::collections::BTreeSet;
 use std::{cmp::Ordering, collections::HashMap, error::Error};
 use thiserror::Error;
 use tokio::select;
@@ -76,11 +77,17 @@ pub struct LogStream {
     cancellation_token: CancellationToken,
 }
 
+enum LogStreamMessage {
+    Started(LogIdentifier),
+    Ended(LogIdentifier),
+    Log(LogLine),
+}
+
 impl LogStream {
     fn new(
         client: Client,
         id: LogIdentifier,
-        tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
+        tx: tokio::sync::mpsc::UnboundedSender<LogStreamMessage>,
     ) -> Self {
         let pods: Api<Pod> = Api::namespaced(client, &id.namespace);
         let podname = id.pod.clone();
@@ -92,16 +99,20 @@ impl LogStream {
             log_params.follow = true;
             log_params.since_seconds = Some(600);
             log_params.timestamps = true;
+            let _ = tx.send(LogStreamMessage::Started(id2.clone()));
             if let Ok(logs) = pods.log_stream(&podname, &log_params).await {
                 let mut lines = logs.lines();
                 loop {
                     select! {
                         _ = cloned_token.cancelled() => {
+                            let _ = tx.send(LogStreamMessage::Ended(id2.clone()));
                             break;
                         }
                         line = lines.try_next() => {
                             if let Ok(Some(line)) = line {
-                                let _ = tx.send(LogLine::new(id2.clone(), line).expect("couldn't create log line"));
+                                let _ = tx.send(LogStreamMessage::Log(
+                                    LogLine::new(id2.clone(), line).expect("couldn't create log line")
+                                ));
                             }
                         }
                     }
@@ -126,12 +137,13 @@ pub enum LogStreamManagerMessage {
     Log(LogLine),
     LogSourceCreated(LogIdentifier),
     LogSourceRemoved(LogIdentifier),
+    LogSourceSubscribed(LogIdentifier),
     LogSourceCancelled(LogIdentifier),
 }
 
 pub struct LogStreamManager {
     client: Client,
-    tx: tokio::sync::mpsc::UnboundedSender<LogLine>,
+    tx: tokio::sync::mpsc::UnboundedSender<LogStreamMessage>,
     outbound_tx: tokio::sync::mpsc::Sender<LogStreamManagerMessage>,
     pub streams: HashMap<LogIdentifier, LogStream>,
     cancellation_token: CancellationToken,
@@ -147,14 +159,31 @@ impl LogStreamManager {
         let cancellation_token2 = cancellation_token.clone();
         tokio::spawn(async move {
             loop {
+                let msg;
                 select! {
                     _ = cancellation_token2.cancelled() => {
                         rx.close();
                         break;
                     }
-                    Some(message) = rx.recv() => {
+                    message = rx.recv() => {
+                        match message {
+                            Some(m) => msg = m,
+                            _ => continue,
+                        }
+                    }
+                }
+                match msg {
+                    LogStreamMessage::Log(m) => {
+                        let _ = outbound_tx2.send(LogStreamManagerMessage::Log(m)).await;
+                    }
+                    LogStreamMessage::Started(id) => {
                         let _ = outbound_tx2
-                            .send(LogStreamManagerMessage::Log(message))
+                            .send(LogStreamManagerMessage::LogSourceSubscribed(id))
+                            .await;
+                    }
+                    LogStreamMessage::Ended(id) => {
+                        let _ = outbound_tx2
+                            .send(LogStreamManagerMessage::LogSourceCancelled(id))
                             .await;
                     }
                 }
