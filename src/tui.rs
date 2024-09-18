@@ -2,6 +2,7 @@ use std::future::IntoFuture;
 
 use crate::k8s::{LogIdentifier, LogLine, LogStreamManager, LogStreamManagerMessage};
 use crossterm::event::KeyCode;
+use futures::future::select;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend as Backend;
 use ratatui::crossterm::{
@@ -150,11 +151,22 @@ impl Tui {
                     .constraints(vec![Constraint::Percentage(75), Constraint::Fill(1)])
                     .split(frame.area());
                 // log messages
-                let rows = self
-                    .messages
-                    .iter()
-                    .map(|log| Row::new(vec![log.id.pod.clone(), log.message.clone()]));
+                let selected = self
+                    .source_table_state
+                    .selected()
+                    .map(|i| self.sources.get(i))
+                    .unwrap_or(None);
+                let rows = self.messages.iter().map(|log| {
+                    let mut row = Row::new(vec![log.id.pod.clone(), log.message.clone()]);
+                    if Some(&log.id) == selected {
+                        row = row.bold();
+                    } else {
+                        row = row.dim();
+                    }
+                    row
+                });
                 let table = Table::new(rows, [Constraint::Min(10), Constraint::Percentage(75)]);
+                self.log_table_state = TableState::new();
                 self.log_table_state.select_last();
                 frame.render_stateful_widget(table, layout[0], &mut self.log_table_state);
                 // log sources
