@@ -2,7 +2,6 @@ use std::future::IntoFuture;
 
 use crate::k8s::{LogIdentifier, LogLine, LogStreamManager, LogStreamManagerMessage};
 use crossterm::event::KeyCode;
-use futures::future::select;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend as Backend;
 use ratatui::crossterm::{
@@ -11,12 +10,12 @@ use ratatui::crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Row, Sparkline, Table, TableState};
+use ratatui::widgets::{Row, Table, TableState};
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Error, Debug)]
@@ -31,6 +30,12 @@ pub enum TuiMessage {
     Exit,
 }
 
+#[derive(Default)]
+struct SourceState {
+    log_lines: BTreeSet<Arc<LogLine>>,
+    closed: bool,
+}
+
 pub struct Tui {
     pub terminal: ratatui::Terminal<Backend<std::io::Stderr>>,
     pub task: JoinHandle<()>,
@@ -38,11 +43,11 @@ pub struct Tui {
     pub tx: tokio::sync::mpsc::Sender<TuiMessage>,
     pub rx: tokio::sync::mpsc::Receiver<TuiMessage>,
     messages: BTreeSet<Arc<LogLine>>,
-    messages_by_src: HashMap<LogIdentifier, BTreeSet<Arc<LogLine>>>,
+    messages_by_src: HashMap<LogIdentifier, SourceState>,
     log_table_state: TableState,
     source_table_state: TableState,
     log_stream_manager: LogStreamManager,
-    sources: Vec<LogIdentifier>,
+    sources: BTreeSet<LogIdentifier>,
 }
 
 impl Tui {
@@ -69,7 +74,7 @@ impl Tui {
             log_table_state: TableState::new(),
             source_table_state: TableState::new(),
             log_stream_manager,
-            sources: vec![],
+            sources: BTreeSet::new(),
         })
     }
 
@@ -113,6 +118,7 @@ impl Tui {
                 *val = self
                     .messages_by_src
                     .get(&id)
+                    .map(|s| &s.log_lines)
                     .unwrap()
                     .iter()
                     .filter(|m| m.timestamp > lasttime - (len - idx) as i128 * period)
@@ -154,7 +160,7 @@ impl Tui {
                 let selected = self
                     .source_table_state
                     .selected()
-                    .map(|i| self.sources.get(i))
+                    .map(|i| self.sources.iter().nth(i))
                     .unwrap_or(None);
                 let rows = self.messages.iter().map(|log| {
                     let mut row = Row::new(vec![log.id.pod.clone(), log.message.clone()]);
@@ -162,6 +168,14 @@ impl Tui {
                         row = row.bold();
                     } else {
                         row = row.dim();
+                    }
+                    if self
+                        .messages_by_src
+                        .get(&log.id)
+                        .expect("couldn't find log state")
+                        .closed
+                    {
+                        row = row.red();
                     }
                     row
                 });
@@ -178,6 +192,9 @@ impl Tui {
                     let mut row = Row::new(vec![sparkline, s.pod.clone()]);
                     if self.log_stream_manager.streams.get(&s).is_some() {
                         row = row.bold();
+                        if self.messages_by_src.get(&s).map(|s| s.closed) == Some(true) {
+                            row = row.red();
+                        }
                     } else {
                         row = row.dim();
                     }
@@ -223,7 +240,7 @@ impl Tui {
 
     fn key_enter(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(idx) = self.source_table_state.selected() {
-            let id = self.sources.get(idx).expect("index out of bounds");
+            let id = self.sources.iter().nth(idx).expect("index out of bounds");
             if self.log_stream_manager.streams.get(&id).is_none() {
                 self.log_stream_manager.add_stream(id.clone());
             } else {
@@ -242,17 +259,21 @@ impl Tui {
                     let id = log.id.clone();
                     self.messages_by_src
                         .get_mut(&id)
+                        .map(|s| &mut s.log_lines)
                         .expect("can't find btree for log source")
                         .insert(log);
                 }
                 LogStreamManagerMessage::LogSourceCreated(src) => {
-                    self.sources.push(src);
+                    self.sources.insert(src);
                 }
                 LogStreamManagerMessage::LogSourceRemoved(src) => {
-                    self.sources.retain(|p| *p != src);
+                    self.messages_by_src
+                        .get_mut(&src)
+                        .expect("can't find source state")
+                        .closed = true;
                 }
                 LogStreamManagerMessage::LogSourceSubscribed(src) => {
-                    self.messages_by_src.insert(src, BTreeSet::new());
+                    self.messages_by_src.insert(src, SourceState::default());
                 }
                 LogStreamManagerMessage::LogSourceCancelled(src) => {
                     self.messages_by_src.remove(&src);

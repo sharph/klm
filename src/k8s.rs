@@ -1,5 +1,5 @@
 use futures::{AsyncBufReadExt, TryStreamExt};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use kube::{
     api::{Api, LogParams, ResourceExt},
     runtime::{watcher, WatchStreamExt},
@@ -25,6 +25,26 @@ impl LogIdentifier {
             pod,
             container,
         }
+    }
+}
+
+impl Ord for LogIdentifier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let o = self.namespace.cmp(&other.namespace);
+        if o != Ordering::Equal {
+            return o;
+        }
+        let o = self.pod.cmp(&other.pod);
+        if o != Ordering::Equal {
+            return o;
+        }
+        self.container.cmp(&other.container)
+    }
+}
+
+impl PartialOrd for LogIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(&other))
     }
 }
 
@@ -194,20 +214,27 @@ impl LogStreamManager {
         let outbound_tx2 = outbound_tx.clone();
         tokio::spawn(async move {
             watcher(pods.clone(), watcher::Config::default())
-                .applied_objects()
+                .touched_objects()
                 .try_for_each(|p| async {
                     let namespace = p.namespace().unwrap_or("".to_string());
                     let pod = p.name_any();
                     for container in p.spec.unwrap().containers.into_iter() {
-                        let _ = outbound_tx2
-                            .send(LogStreamManagerMessage::LogSourceCreated(
-                                LogIdentifier::new(
-                                    namespace.clone(),
-                                    pod.clone(),
-                                    Some(container.name.to_string()),
-                                ),
-                            ))
-                            .await;
+                        let log_line = LogIdentifier::new(
+                            namespace.clone(),
+                            pod.clone(),
+                            Some(container.name.to_string()),
+                        );
+                        if ["Succeeded", "Failed"].iter().any(|s| {
+                            p.status.as_ref().map(|s| s.phase.clone()) == Some(Some(s.to_string()))
+                        }) {
+                            let _ = outbound_tx2
+                                .send(LogStreamManagerMessage::LogSourceRemoved(log_line))
+                                .await;
+                        } else {
+                            let _ = outbound_tx2
+                                .send(LogStreamManagerMessage::LogSourceCreated(log_line))
+                                .await;
+                        }
                     }
                     Ok(())
                 })
