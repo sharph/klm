@@ -5,7 +5,6 @@ use kube::{
     runtime::{watcher, WatchStreamExt},
     Client,
 };
-use std::collections::BTreeSet;
 use std::{cmp::Ordering, collections::HashMap, error::Error};
 use thiserror::Error;
 use tokio::select;
@@ -15,15 +14,25 @@ use tokio_util::sync::CancellationToken;
 pub struct LogIdentifier {
     pub namespace: String,
     pub pod: String,
-    pub container: Option<String>,
+    pub container: String,
+    pub show_container: bool,
 }
 
 impl LogIdentifier {
-    fn new(namespace: String, pod: String, container: Option<String>) -> Self {
+    fn new(namespace: String, pod: String, container: String, show_container: bool) -> Self {
         Self {
             namespace,
             pod,
             container,
+            show_container,
+        }
+    }
+
+    pub fn format(&self) -> String {
+        if self.show_container {
+            format!("{} {}", self.pod, self.container)
+        } else {
+            self.pod.clone()
         }
     }
 }
@@ -58,6 +67,7 @@ enum LogLineError {
 pub struct LogLine {
     pub id: LogIdentifier,
     pub message: String,
+    pub stripped: String,
     pub timestamp: i128,
 }
 
@@ -76,6 +86,7 @@ impl PartialOrd for LogLine {
 impl LogLine {
     fn new(id: LogIdentifier, message: String) -> Result<Self, Box<dyn Error>> {
         if let Some((timestamp, message)) = message.split_once(" ") {
+            let stripped = strip_ansi_escapes::strip_str(message);
             let timestamp = time::OffsetDateTime::parse(
                 timestamp,
                 &time::format_description::well_known::Rfc3339,
@@ -85,6 +96,7 @@ impl LogLine {
                 id,
                 message: message.to_string(),
                 timestamp,
+                stripped,
             })
         } else {
             Err(Box::new(LogLineError::NoTimestamp))
@@ -222,11 +234,14 @@ impl LogStreamManager {
                 .try_for_each(|p| async {
                     let namespace = p.namespace().unwrap_or("".to_string());
                     let pod = p.name_any();
-                    for container in p.spec.unwrap().containers.into_iter() {
+                    let spec = p.spec.unwrap();
+                    let many_containers = spec.containers.len() > 1;
+                    for container in spec.containers.into_iter() {
                         let log_id = LogIdentifier::new(
                             namespace.clone(),
                             pod.clone(),
-                            Some(container.name.to_string()),
+                            container.name.to_string(),
+                            many_containers,
                         );
                         if ["Succeeded", "Failed"].iter().any(|s| {
                             p.status.as_ref().map(|s| s.phase.clone()) == Some(Some(s.to_string()))

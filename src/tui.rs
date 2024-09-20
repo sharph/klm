@@ -161,7 +161,7 @@ impl Tui {
                     .map(|i| self.sources.iter().nth(i))
                     .unwrap_or(None);
                 let rows = self.messages.iter().map(|log| {
-                    let mut row = Row::new(vec![log.id.pod.clone(), log.message.clone()]);
+                    let mut row = Row::new(vec![log.id.format(), log.stripped.clone()]);
                     if Some(&log.id) == selected.map(|x| x.0) {
                         row = row.bold();
                     } else {
@@ -187,7 +187,7 @@ impl Tui {
                         .get(&s.0)
                         .map(|v| v.clone())
                         .unwrap_or_else(|| "     ".to_string());
-                    let mut row = Row::new(vec![sparkline, s.0.pod.clone()]);
+                    let mut row = Row::new(vec![sparkline, s.0.format()]);
                     if self.log_stream_manager.streams.get(&s.0).is_some() {
                         row = row.bold();
                         if self.sources.get(&s.0).map(|s| s.closed) == Some(true) {
