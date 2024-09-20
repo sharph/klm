@@ -120,13 +120,12 @@ impl LogStream {
             log_params.since_seconds = Some(600);
             log_params.timestamps = true;
             let _ = tx.send(LogStreamMessage::Started(id2.clone()));
-            if let Ok(logs) = pods.log_stream(&podname, &log_params).await {
+            while let Ok(logs) = pods.log_stream(&podname, &log_params).await {
                 let mut lines = logs.lines();
                 loop {
                     select! {
                         _ = cloned_token.cancelled() => {
-                            let _ = tx.send(LogStreamMessage::Ended(id2.clone()));
-                            break;
+                            return;
                         }
                         line = lines.try_next() => {
                             if let Ok(Some(line)) = line {
@@ -155,7 +154,7 @@ enum LogStreamManagerError {
 #[derive(Debug)]
 pub enum LogStreamManagerMessage {
     Log(LogLine),
-    LogSourceCreated(LogIdentifier),
+    LogSourceUpdated(LogIdentifier),
     LogSourceRemoved(LogIdentifier),
     LogSourceSubscribed(LogIdentifier),
     LogSourceCancelled(LogIdentifier),
@@ -219,7 +218,7 @@ impl LogStreamManager {
                     let namespace = p.namespace().unwrap_or("".to_string());
                     let pod = p.name_any();
                     for container in p.spec.unwrap().containers.into_iter() {
-                        let log_line = LogIdentifier::new(
+                        let log_id = LogIdentifier::new(
                             namespace.clone(),
                             pod.clone(),
                             Some(container.name.to_string()),
@@ -228,11 +227,11 @@ impl LogStreamManager {
                             p.status.as_ref().map(|s| s.phase.clone()) == Some(Some(s.to_string()))
                         }) {
                             let _ = outbound_tx2
-                                .send(LogStreamManagerMessage::LogSourceRemoved(log_line))
+                                .send(LogStreamManagerMessage::LogSourceRemoved(log_id))
                                 .await;
                         } else {
                             let _ = outbound_tx2
-                                .send(LogStreamManagerMessage::LogSourceCreated(log_line))
+                                .send(LogStreamManagerMessage::LogSourceUpdated(log_id))
                                 .await;
                         }
                     }

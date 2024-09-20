@@ -11,7 +11,7 @@ use ratatui::crossterm::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Row, Table, TableState};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 use thiserror::Error;
@@ -43,11 +43,10 @@ pub struct Tui {
     pub tx: tokio::sync::mpsc::Sender<TuiMessage>,
     pub rx: tokio::sync::mpsc::Receiver<TuiMessage>,
     messages: BTreeSet<Arc<LogLine>>,
-    messages_by_src: HashMap<LogIdentifier, SourceState>,
+    sources: BTreeMap<LogIdentifier, SourceState>,
     log_table_state: TableState,
     source_table_state: TableState,
     log_stream_manager: LogStreamManager,
-    sources: BTreeSet<LogIdentifier>,
 }
 
 impl Tui {
@@ -70,11 +69,10 @@ impl Tui {
             tx,
             rx,
             messages: BTreeSet::new(),
-            messages_by_src: HashMap::new(),
             log_table_state: TableState::new(),
             source_table_state: TableState::new(),
             log_stream_manager,
-            sources: BTreeSet::new(),
+            sources: BTreeMap::new(),
         })
     }
 
@@ -104,11 +102,6 @@ impl Tui {
     }
 
     pub fn get_sparkline_for_source(&self, id: &LogIdentifier, buckets: usize) -> String {
-        if self.messages_by_src.get(&id).is_none() {
-            return (0..buckets)
-                .map(|_| ratatui::symbols::bar::NINE_LEVELS.empty)
-                .fold(String::new(), |a, b| a + b);
-        }
         let mut buckets: Box<[u64]> = (0..buckets).map(|_| 0).collect();
         let period: i128 = 60 * 1_000_000_000;
         if let Some(last) = self.messages.last() {
@@ -116,7 +109,7 @@ impl Tui {
             let len = buckets.len();
             for (idx, val) in buckets.iter_mut().enumerate() {
                 *val = self
-                    .messages_by_src
+                    .sources
                     .get(&id)
                     .map(|s| &s.log_lines)
                     .unwrap()
@@ -147,7 +140,7 @@ impl Tui {
 
     pub fn draw(&mut self) -> Result<(), Box<dyn Error>> {
         let mut sparkline_data: HashMap<LogIdentifier, String> = HashMap::new();
-        for id in self.log_stream_manager.streams.keys() {
+        for id in self.sources.keys() {
             sparkline_data.insert(id.clone(), self.get_sparkline_for_source(&id, 10));
         }
         self.terminal
@@ -164,13 +157,13 @@ impl Tui {
                     .unwrap_or(None);
                 let rows = self.messages.iter().map(|log| {
                     let mut row = Row::new(vec![log.id.pod.clone(), log.message.clone()]);
-                    if Some(&log.id) == selected {
+                    if Some(&log.id) == selected.map(|x| x.0) {
                         row = row.bold();
                     } else {
                         row = row.dim();
                     }
                     if self
-                        .messages_by_src
+                        .sources
                         .get(&log.id)
                         .expect("couldn't find log state")
                         .closed
@@ -186,13 +179,13 @@ impl Tui {
                 // log sources
                 let rows = self.sources.iter().map(|s| {
                     let sparkline = sparkline_data
-                        .get(&s)
+                        .get(&s.0)
                         .map(|v| v.clone())
                         .unwrap_or_else(|| "     ".to_string());
-                    let mut row = Row::new(vec![sparkline, s.pod.clone()]);
-                    if self.log_stream_manager.streams.get(&s).is_some() {
+                    let mut row = Row::new(vec![sparkline, s.0.pod.clone()]);
+                    if self.log_stream_manager.streams.get(&s.0).is_some() {
                         row = row.bold();
-                        if self.messages_by_src.get(&s).map(|s| s.closed) == Some(true) {
+                        if self.sources.get(&s.0).map(|s| s.closed) == Some(true) {
                             row = row.red();
                         }
                     } else {
@@ -240,10 +233,22 @@ impl Tui {
 
     fn key_enter(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(idx) = self.source_table_state.selected() {
-            let id = self.sources.iter().nth(idx).expect("index out of bounds");
+            let id = self
+                .sources
+                .iter()
+                .nth(idx)
+                .map(|x| x.0)
+                .expect("index out of bounds")
+                .clone();
             if self.log_stream_manager.streams.get(&id).is_none() {
                 self.log_stream_manager.add_stream(id.clone());
             } else {
+                let src = self.sources.get_mut(&id).expect("no source state");
+                if src.closed {
+                    src.log_lines.clear();
+                    self.sources.remove(&id);
+                    self.messages.retain(|m| m.id != id);
+                }
                 self.log_stream_manager.drop_stream(&id)?;
             }
         }
@@ -257,26 +262,34 @@ impl Tui {
                     let log = Arc::new(log);
                     self.messages.insert(log.clone());
                     let id = log.id.clone();
-                    self.messages_by_src
-                        .get_mut(&id)
-                        .map(|s| &mut s.log_lines)
-                        .expect("can't find btree for log source")
-                        .insert(log);
+                    if let Some(src) = self.sources.get_mut(&id).map(|s| &mut s.log_lines) {
+                        src.insert(log);
+                    }
                 }
-                LogStreamManagerMessage::LogSourceCreated(src) => {
-                    self.sources.insert(src);
+                LogStreamManagerMessage::LogSourceUpdated(src) => {
+                    if self.sources.get(&src).is_none() {
+                        self.sources.insert(src, SourceState::default());
+                    }
                 }
-                LogStreamManagerMessage::LogSourceRemoved(src) => {
-                    self.messages_by_src
-                        .get_mut(&src)
-                        .expect("can't find source state")
-                        .closed = true;
+                LogStreamManagerMessage::LogSourceRemoved(id) => {
+                    let mut remove = false;
+                    if let Some(src) = self.sources.get_mut(&id) {
+                        if src.log_lines.len() > 0 {
+                            src.closed = true;
+                        } else {
+                            remove = true;
+                        }
+                    }
+                    if remove {
+                        self.sources.remove(&id);
+                        self.messages.retain(|m| m.id != id)
+                    }
                 }
-                LogStreamManagerMessage::LogSourceSubscribed(src) => {
-                    self.messages_by_src.insert(src, SourceState::default());
-                }
+                LogStreamManagerMessage::LogSourceSubscribed(src) => {}
                 LogStreamManagerMessage::LogSourceCancelled(src) => {
-                    self.messages_by_src.remove(&src);
+                    if let Some(src) = self.sources.get_mut(&src) {
+                        src.log_lines.clear();
+                    }
                     self.messages.retain(|m| m.id != src)
                 }
             },
