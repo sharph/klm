@@ -115,6 +115,7 @@ impl LogStream {
         let cancellation_token = CancellationToken::new();
         let cloned_token = cancellation_token.clone();
         tokio::spawn(async move {
+            let mut last = 0;
             let mut log_params = LogParams::default();
             log_params.follow = true;
             log_params.since_seconds = Some(600);
@@ -129,9 +130,13 @@ impl LogStream {
                         }
                         line = lines.try_next() => {
                             if let Ok(Some(line)) = line {
-                                let _ = tx.send(LogStreamMessage::Log(
-                                    LogLine::new(id2.clone(), line).expect("couldn't create log line")
-                                ));
+                                let log_line = LogLine::new(id2.clone(), line).expect("couldn't create log line");
+                                if log_line.timestamp > last {
+                                    last = log_line.timestamp;
+                                    let _ = tx.send(LogStreamMessage::Log(
+                                        log_line
+                                    ));
+                                }
                             }
                         }
                     }
