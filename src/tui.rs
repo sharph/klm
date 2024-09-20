@@ -147,7 +147,11 @@ impl Tui {
         self.terminal
             .draw(|frame: &mut Frame| {
                 let layout = Layout::default()
-                    .direction(Direction::Horizontal)
+                    .direction(if frame.area().right() > 200 {
+                        Direction::Horizontal
+                    } else {
+                        Direction::Vertical
+                    })
                     .constraints(vec![Constraint::Percentage(75), Constraint::Fill(1)])
                     .split(frame.area());
                 // log messages
