@@ -51,7 +51,8 @@ pub struct Tui {
 
 impl Tui {
     pub async fn new() -> Result<Self, Box<dyn Error>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (tx, rx) = tokio::sync::mpsc::channel(2); // a small buffer here keeps the sending
+                                                      // fair and UI snappy
         let (ls_tx, mut ls_rx) = tokio::sync::mpsc::channel(32);
         let tx2 = tx.clone();
         tokio::spawn(async move {
