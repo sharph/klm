@@ -2,6 +2,7 @@
 name = "klm"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/sharph/klm"
 
 [dependencies]
 crossterm = { version = "0.28.1", features = ["event-stream"] }
@@ -14,3 +15,23 @@ thiserror = "1.0.63"
 time = { version = "0.3.36", features = ["parsing"] }
 tokio = { version = "1.40.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-util = "0.7.12"
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'cargo dist'
+[workspace.metadata.dist]
+# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.22.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
